@@ -1,0 +1,59 @@
+GET logs-ti_test/_count
+
+GET filebeat-url/_count
+
+GET filebeat-url/_count
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "exists": {
+            "field": "threat"
+          }
+        }
+      ]
+    }
+  }
+}
+
+GET filebeat-url/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "exists": {
+            "field": "threat"
+          }
+        }
+      ]
+    }
+  }
+}
+
+GET filebeat-url/_search
+{
+  "size": 0,
+  "aggs": {
+    "urls": {
+      "terms": {
+        "field": "url.full",
+        "size": 1000
+      }
+    }
+  }
+}
+
+GET logs-ti_test/_search
+{
+  "size": 0,
+  "aggs": {
+    "urls": {
+      "terms": {
+        "field": "threat.indicator.url.full",
+        "size": 50
+      }
+    }
+  }
+}
