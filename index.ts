@@ -39,6 +39,10 @@ const entry = async () => {
   await eachLimit(allThreats, CONCURRENCY, async (threat, cb) => {
     const threatValue = threat._source?.["threat.indicator.url.full"];
 
+    if (!threatValue) {
+      return cb();
+    }
+
     console.log(`processing ${threatValue}`);
 
     try {
