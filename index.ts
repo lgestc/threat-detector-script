@@ -40,6 +40,8 @@ const entry = async () => {
     const threatValue = threat._source?.["threat.indicator.url.full"];
 
     if (!threatValue) {
+      progress++;
+
       return cb();
     }
 
