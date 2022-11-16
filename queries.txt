@@ -2,6 +2,8 @@ GET logs-ti_test/_count
 
 GET filebeat-url/_count
 
+
+// how many matches were identified
 GET filebeat-url/_count
 {
   "query": {
@@ -32,6 +34,7 @@ GET filebeat-url/_search
   }
 }
 
+// unique urls in events
 GET filebeat-url/_search
 {
   "size": 0,
@@ -45,6 +48,7 @@ GET filebeat-url/_search
   }
 }
 
+// unique urls in threats
 GET logs-ti_test/_search
 {
   "size": 0,
@@ -52,6 +56,20 @@ GET logs-ti_test/_search
     "urls": {
       "terms": {
         "field": "threat.indicator.url.full",
+        "size": 50
+      }
+    }
+  }
+}
+
+// how to get threat summary, sorted by occurrence count
+GET logs-ti_test/_search
+{
+  "size": 0,
+  "aggs": {
+    "urls": {
+      "terms": {
+        "field": "threat.detection.indicator",
         "size": 50
       }
     }

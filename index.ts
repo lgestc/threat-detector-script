@@ -27,16 +27,18 @@ const CONCURRENCY = 12;
 const entry = async () => {
   const start = Date.now();
 
-  // TODO dont store everything in memory lol.
+  // TODO don't store everything in memory
   // This may work with 100k threats, but needs to take memory limitations into account.
-  // Ideally, this should be an async iterator.
-  // Also, threats should be partitioned so that each Kibana node receives a portion of these to process.
+  // Ideally, this should be an async iterator, an event emitter or something similar to this.
+  // Even better, it should be possible to run multiple instances of this iteration process across the stack.
+  // Maybe we could run separate worker per threat type, initially? Something to consider.
   const allThreats = await getAllDocuments<Threat>(client, THREATS_INDEX);
 
   const total = allThreats.length;
   let progress = 0;
 
   await eachLimit(allThreats, CONCURRENCY, async (threat, cb) => {
+    // TODO support all the value props, not just the url, see :62
     const threatValue = threat._source?.["threat.indicator.url.full"];
 
     if (!threatValue) {
@@ -89,7 +91,8 @@ const entry = async () => {
         },
       };
 
-      // This marks all the events matching the threat with a timestamp and threat id, so that we can do aggregations on this information later.
+      // This marks all the events matching the threat with a timestamp and threat id, so that we can do
+      // aggregations on this information later.
       // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
       await mark(client, EVENTS_INDEX, query, threat._id, Date.now());
 
