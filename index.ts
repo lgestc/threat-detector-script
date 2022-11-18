@@ -1,8 +1,8 @@
 import { Client } from "@elastic/elasticsearch";
 import { scan } from "./scan";
 
-const EVENTS_INDEX = "filebeat-url";
-const THREATS_INDEX = "logs-ti_*";
+const EVENTS_INDEX = ["filebeat-*"];
+const THREATS_INDEX = ["logs-ti_*"];
 
 const client = new Client({
   auth: {
