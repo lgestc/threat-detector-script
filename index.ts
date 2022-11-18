@@ -16,11 +16,14 @@ const client = new Client({
 const CONCURRENCY = 4;
 
 const entry = async () => {
-  await scan(client, {
-    eventsIndex: EVENTS_INDEX,
-    threatIndex: THREATS_INDEX,
-    concurrency: CONCURRENCY,
-  });
+  await scan(
+    { client, log: console.log },
+    {
+      eventsIndex: EVENTS_INDEX,
+      threatIndex: THREATS_INDEX,
+      concurrency: CONCURRENCY,
+    }
+  );
 };
 
 entry();

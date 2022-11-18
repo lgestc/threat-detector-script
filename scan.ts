@@ -1,14 +1,130 @@
 import { Client } from "@elastic/elasticsearch";
-import { QueryDslQueryContainer } from "@elastic/elasticsearch/lib/api/types";
 import { eachLimit } from "async";
 
-import { getAllDocuments } from "./get_all_documents";
-import { mark as mark, THREAT_DETECTION_INDICATOR_FIELD } from "./mark";
-import { shouldClauseForThreat } from "./should_clause_for_threat";
-import { Threat } from "./threat";
+export interface Threat {
+  "threat.indicator.type": string;
+  "threat.indicator.url.full": string;
+  "threat.indicator.file.hash.md5": string;
+  "threat.indicator.file.hash.sha1": string;
+}
+
+import {
+  OpenPointInTimeResponse,
+  SortResults,
+  QueryDslQueryContainer,
+  SearchHit,
+} from "@elastic/elasticsearch/lib/api/types";
+
+/**
+ * Returns filter clause with 'match' conditions for relevant fields only
+ * @param threat
+ * @returns
+ */
+export const shouldClauseForThreat = (threat: Threat) => {
+  switch (threat["threat.indicator.type"]) {
+    case "url": {
+      return [
+        {
+          match: {
+            "url.full": threat["threat.indicator.url.full"],
+          },
+        },
+      ];
+    }
+
+    case "file": {
+      return [
+        {
+          match: {
+            "file.hash.md5": threat["threat.indicator.file.hash.md5"],
+            "file.hash.sha1": threat["threat.indicator.file.hash.sha1"],
+          },
+        },
+      ];
+    }
+  }
+};
+
+export const THREAT_DETECTION_INDICATOR_FIELD =
+  "threat.detection.indicator" as const;
+
+export const mark = async (
+  es: Client,
+  index: string,
+  query: QueryDslQueryContainer,
+  indicator: string,
+  timestamp: number
+) =>
+  es.updateByQuery({
+    index,
+    query,
+    script: {
+      lang: "painless",
+      source: `ctx._source["threat.detection.timestamp"] = params.timestamp; ctx._source["${THREAT_DETECTION_INDICATOR_FIELD}"] = params.indicator`,
+      params: {
+        timestamp,
+        indicator,
+      },
+    },
+    conflicts: "proceed",
+    refresh: false,
+  });
+
+export const getDocuments = async <T = unknown>(
+  es: Client,
+  pit: string,
+  query?: QueryDslQueryContainer,
+  after?: any
+): Promise<Array<SearchHit<T>>> => {
+  const {
+    hits: { hits },
+  } = await es.search<T>({
+    pit: {
+      id: `${pit}`,
+      keep_alive: "1m",
+    },
+    size: 1000,
+    sort: ["@timestamp"],
+    ...(query ? { query } : {}),
+    ...(after ? { search_after: after } : {}),
+  });
+
+  return hits;
+};
+
+export const getAllDocuments = async <T = unknown>(
+  client: Client,
+  index: string,
+  query?: QueryDslQueryContainer
+): Promise<Array<SearchHit<T>>> => {
+  let after: SortResults | undefined;
+
+  const pit: OpenPointInTimeResponse["id"] = (
+    await client.openPointInTime({
+      index,
+      keep_alive: "1m",
+    })
+  ).id;
+
+  const allDocs: Array<SearchHit<T>> = [];
+
+  while (true) {
+    const docs = await getDocuments<T>(client, pit, query, after);
+
+    if (!docs.length) {
+      break;
+    }
+
+    after = docs[docs.length - 1].sort;
+
+    allDocs.push(...docs);
+  }
+
+  return allDocs;
+};
 
 export const scan = async (
-  client: Client,
+  { client, log }: { client: Client; log: (message: string) => void },
   {
     threatIndex,
     eventsIndex,
@@ -41,7 +157,7 @@ export const scan = async (
         const shouldClause = shouldClauseForThreat(threat);
 
         if (!shouldClause) {
-          console.warn(
+          log(
             `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
           );
           progress++;
@@ -74,7 +190,7 @@ export const scan = async (
 
       progress++;
 
-      console.log(`${progress}/${total}`);
+      log(`${progress}/${total}`);
     }
   );
 
@@ -84,5 +200,5 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  console.log(`done in ${duration}, tps: ${tps}`);
+  log(`done in ${duration}, tps: ${tps}`);
 };
