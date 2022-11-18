@@ -1,5 +1,14 @@
-import { Client } from "@elastic/elasticsearch";
-import { eachLimit } from "async";
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+import type { Client } from "@elastic/elasticsearch";
+import async from "async";
 
 export interface Threat {
   "threat.indicator.type": string;
@@ -8,7 +17,7 @@ export interface Threat {
   "threat.indicator.file.hash.sha1": string;
 }
 
-import {
+import type {
   OpenPointInTimeResponse,
   SortResults,
   QueryDslQueryContainer,
@@ -123,15 +132,59 @@ export const getAllDocuments = async <T = unknown>(
   return allDocs;
 };
 
+async function* threatsGenerator<T>(
+  client: Client,
+  index: string,
+  query?: QueryDslQueryContainer
+) {
+  let after: SortResults | undefined;
+
+  const pit: OpenPointInTimeResponse["id"] = (
+    await client.openPointInTime({
+      index,
+      keep_alive: "1m",
+    })
+  ).id;
+
+  while (true) {
+    const docs = await getDocuments<T>(client, pit, query, after);
+
+    if (!docs.length) {
+      break;
+    }
+
+    after = docs[docs.length - 1].sort;
+
+    yield docs;
+  }
+}
+
 export const scan = async (
   { client, log }: { client: Client; log: (message: string) => void },
   {
     threatIndex,
     eventsIndex,
     concurrency,
-  }: { threatIndex: string; eventsIndex: string; concurrency: number }
+    verbose,
+  }: {
+    threatIndex: string;
+    eventsIndex: string;
+    concurrency: number;
+    verbose: boolean;
+  }
 ) => {
+  log("starting scan");
+
   const start = Date.now();
+
+  const verboseLog = (message: string) => {
+    if (!verbose) {
+      return;
+    }
+
+    log(message);
+  };
+
   let progress = 0;
 
   // TODO don't store everything in memory
@@ -143,54 +196,49 @@ export const scan = async (
 
   const total = allThreats.length;
 
-  await eachLimit(
+  // for await (const threats of threatsGenerator(client, threatIndex)) {
+  // }
+
+  await async.eachLimit(
     allThreats,
     concurrency,
-    async ({ _source: threat, _id: threatId }, cb) => {
-      if (!threat) {
-        progress++;
-
-        return cb();
-      }
-
-      try {
-        const shouldClause = shouldClauseForThreat(threat);
-
-        if (!shouldClause) {
-          log(
-            `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
-          );
-          progress++;
-          return cb();
-        }
-
-        const query: QueryDslQueryContainer = {
-          bool: {
-            // This prevents processing events that were already checked. That means, after initial "scan",
-            // subsequent runs will be a lot faster - as we are not updating the events we already noticed as
-            // matching the threat.
-            must_not: {
-              exists: {
-                field: THREAT_DETECTION_INDICATOR_FIELD,
-              },
-            },
-            should: shouldClause,
-          },
-        };
-
-        // This marks all the events matching the threat with a timestamp and threat id, so that we can do
-        // aggregations on this information later.
-        // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
-        await mark(client, eventsIndex, query, threatId, Date.now());
-
-        cb();
-      } catch (error: any) {
-        cb(error);
-      }
-
+    async ({ _source: threat, _id: threatId }) => {
       progress++;
 
-      log(`${progress}/${total}`);
+      verboseLog(`processing threats: ${progress}/${total}`);
+
+      if (!threat) {
+        verboseLog(`source is missing`);
+        return;
+      }
+
+      const shouldClause = shouldClauseForThreat(threat);
+
+      if (!shouldClause) {
+        verboseLog(
+          `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
+        );
+        return;
+      }
+
+      const query: QueryDslQueryContainer = {
+        bool: {
+          // This prevents processing events that were already checked. That means, after initial "scan",
+          // subsequent runs will be a lot faster - as we are not updating the events we already noticed as
+          // matching the threat.
+          must_not: {
+            exists: {
+              field: THREAT_DETECTION_INDICATOR_FIELD,
+            },
+          },
+          should: shouldClause,
+        },
+      };
+
+      // This marks all the events matching the threat with a timestamp and threat id, so that we can do
+      // aggregations on this information later.
+      // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
+      await mark(client, eventsIndex, query, threatId, Date.now());
     }
   );
 
@@ -200,5 +248,5 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  log(`done in ${duration}, tps: ${tps}`);
+  log(`scan done in ${duration}s, threats per second: ${tps}`);
 };
