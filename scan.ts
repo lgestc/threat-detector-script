@@ -101,38 +101,10 @@ export const getDocuments = async <T = unknown>(
   return hits;
 };
 
-export const getAllDocuments = async <T = unknown>(
-  client: Client,
-  index: string,
-  query?: QueryDslQueryContainer
-): Promise<Array<SearchHit<T>>> => {
-  let after: SortResults | undefined;
+export const countDocuments = async (client: Client, index: string) =>
+  (await client.count({ index })).count;
 
-  const pit: OpenPointInTimeResponse["id"] = (
-    await client.openPointInTime({
-      index,
-      keep_alive: "1m",
-    })
-  ).id;
-
-  const allDocs: Array<SearchHit<T>> = [];
-
-  while (true) {
-    const docs = await getDocuments<T>(client, pit, query, after);
-
-    if (!docs.length) {
-      break;
-    }
-
-    after = docs[docs.length - 1].sort;
-
-    allDocs.push(...docs);
-  }
-
-  return allDocs;
-};
-
-async function* threatsGenerator<T>(
+async function* documentGenerator<T>(
   client: Client,
   index: string,
   query?: QueryDslQueryContainer
@@ -173,10 +145,6 @@ export const scan = async (
     verbose: boolean;
   }
 ) => {
-  log("starting scan");
-
-  const start = Date.now();
-
   const verboseLog = (message: string) => {
     if (!verbose) {
       return;
@@ -185,62 +153,57 @@ export const scan = async (
     log(message);
   };
 
+  log("starting scan");
+
+  const total = await countDocuments(client, threatIndex);
   let progress = 0;
 
-  // TODO don't store everything in memory
-  // This may work with 100k threats, but needs to take memory limitations into account.
-  // Ideally, this should be an async iterator, an event emitter or something similar to this.
-  // Even better, it should be possible to run multiple instances of this iteration process across the stack.
-  // Maybe we could run separate worker per threat type, initially? Something to consider.
-  const allThreats = await getAllDocuments<Threat>(client, threatIndex);
+  const start = Date.now();
 
-  const total = allThreats.length;
+  for await (const threats of documentGenerator<Threat>(client, threatIndex)) {
+    await async.eachLimit(
+      threats,
+      concurrency,
+      async ({ _source: threat, _id: threatId }) => {
+        progress++;
 
-  // for await (const threats of threatsGenerator(client, threatIndex)) {
-  // }
+        verboseLog(`processing threats: ${progress}/${total}`);
 
-  await async.eachLimit(
-    allThreats,
-    concurrency,
-    async ({ _source: threat, _id: threatId }) => {
-      progress++;
+        if (!threat) {
+          verboseLog(`source is missing`);
+          return;
+        }
 
-      verboseLog(`processing threats: ${progress}/${total}`);
+        const shouldClause = shouldClauseForThreat(threat);
 
-      if (!threat) {
-        verboseLog(`source is missing`);
-        return;
-      }
+        if (!shouldClause) {
+          verboseLog(
+            `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
+          );
+          return;
+        }
 
-      const shouldClause = shouldClauseForThreat(threat);
-
-      if (!shouldClause) {
-        verboseLog(
-          `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
-        );
-        return;
-      }
-
-      const query: QueryDslQueryContainer = {
-        bool: {
-          // This prevents processing events that were already checked. That means, after initial "scan",
-          // subsequent runs will be a lot faster - as we are not updating the events we already noticed as
-          // matching the threat.
-          must_not: {
-            exists: {
-              field: THREAT_DETECTION_INDICATOR_FIELD,
+        const query: QueryDslQueryContainer = {
+          bool: {
+            // This prevents processing events that were already checked. That means, after initial "scan",
+            // subsequent runs will be a lot faster - as we are not updating the events we already noticed as
+            // matching the threat.
+            must_not: {
+              exists: {
+                field: THREAT_DETECTION_INDICATOR_FIELD,
+              },
             },
+            should: shouldClause,
           },
-          should: shouldClause,
-        },
-      };
+        };
 
-      // This marks all the events matching the threat with a timestamp and threat id, so that we can do
-      // aggregations on this information later.
-      // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
-      await mark(client, eventsIndex, query, threatId, Date.now());
-    }
-  );
+        // This marks all the events matching the threat with a timestamp and threat id, so that we can do
+        // aggregations on this information later.
+        // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
+        await mark(client, eventsIndex, query, threatId, Date.now());
+      }
+    );
+  }
 
   const end = Date.now();
 
