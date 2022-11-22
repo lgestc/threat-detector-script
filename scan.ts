@@ -237,9 +237,7 @@ export const scan = async (
 
         const count = await countDocuments(client, eventsIndex, query, 100);
 
-        if (count) {
-          matches.push({ count, id: threatId, index: threatIndex });
-        }
+        matches.push({ count, id: threatId, index: threatIndex });
       }
     );
 
