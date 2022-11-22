@@ -22,6 +22,7 @@ import type {
   SortResults,
   QueryDslQueryContainer,
   SearchHit,
+  BulkUpdateOperation,
 } from "@elastic/elasticsearch/lib/api/types";
 
 /**
@@ -196,13 +197,15 @@ export const scan = async (
   let updatesCount = 0;
 
   for await (const threats of documentGenerator<Threat>(client, threatIndex)) {
+    const matches: Array<{ count: number; id: string; index: string }> = [];
+
     await async.eachLimit(
       threats,
       concurrency,
-      async ({ _source: threat, _id: threatId, _index }) => {
+      async ({ _source: threat, _id: threatId, _index: threatIndex }) => {
         progress++;
 
-        verboseLog(`processing threat ${threatId} (${progress}/${total})`);
+        // verboseLog(`processing threat ${threatId} (${progress}/${total})`);
 
         if (!threat) {
           verboseLog(`source is missing`);
@@ -232,25 +235,25 @@ export const scan = async (
           },
         };
 
-        const matches = await countDocuments(client, eventsIndex, query, 100);
+        const count = await countDocuments(client, eventsIndex, query, 100);
 
-        await client.update({
-          index: _index,
-          id: threatId,
-          script: {
-            lang: "painless",
-            source: `ctx._source["${THREAT_DETECTION_TIMESTAMP_FIELD}"] = params.timestamp; ctx._source["${THREAT_DETECTION_MATCH_COUNT_FIELD}"] = params.indicator`,
-            params: {
-              timestamp: Date.now(),
-              count: matches,
-            },
-          },
-          refresh: false,
-        });
-
-        verboseLog(`${matches} matches found for threat ${threatId}`);
+        if (count) {
+          matches.push({ count, id: threatId, index: threatIndex });
+        }
       }
     );
+
+    const operations: any[] = matches.flatMap((match) => [
+      {
+        update: {
+          _id: match.id,
+          _index: match.index,
+        },
+      },
+      { doc: { [THREAT_DETECTION_MATCH_COUNT_FIELD]: match.count } },
+    ]);
+
+    await client.bulk({ operations });
   }
 
   const end = Date.now();
