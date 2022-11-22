@@ -118,8 +118,19 @@ export const getDocuments = async <T = unknown>(
   return hits;
 };
 
-export const countDocuments = async (client: Client, index: string[]) =>
-  (await client.count({ index })).count;
+export const countDocuments = async (
+  client: Client,
+  index: string[],
+  query?: QueryDslQueryContainer,
+  terminateAfter?: number
+) =>
+  (
+    await client.count({
+      index,
+      query,
+      terminate_after: terminateAfter,
+    })
+  ).count;
 
 async function* documentGenerator<T>(
   client: Client,
@@ -220,23 +231,27 @@ export const scan = async (
           },
         };
 
+        const matches = await countDocuments(client, eventsIndex, query, 100);
+
+        verboseLog(`${matches} matches found for threat ${threatId}`);
+
         // This marks all the events matching the threat with a timestamp and threat id, so that we can do
         // aggregations on this information later.
         // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
-        const {
-          batches,
-          updated,
-          total: processedCount,
-          requests_per_second: rps,
-        } = await mark(client, eventsIndex, query, threatId, Date.now());
+        // const {
+        //   batches,
+        //   updated,
+        //   total: processedCount,
+        //   requests_per_second: rps,
+        // } = await mark(client, eventsIndex, query, threatId, Date.now());
 
-        updatesCount += updated || 0;
+        // updatesCount += updated || 0;
 
-        if (updated) {
-          verboseLog(
-            `batches=${batches} updated=${updated} rps=${rps} processed_count=${processedCount}`
-          );
-        }
+        // if (updated) {
+        //   verboseLog(
+        //     `batches=${batches} updated=${updated} rps=${rps} processed_count=${processedCount}`
+        //   );
+        // }
       }
     );
   }
