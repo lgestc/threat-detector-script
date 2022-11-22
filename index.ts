@@ -13,7 +13,7 @@ const client = new Client({
 });
 
 // How many threat processing tasks should be running at any given time
-const CONCURRENCY = 4;
+const CONCURRENCY = 8;
 
 const entry = async () => {
   await scan(

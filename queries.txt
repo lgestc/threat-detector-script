@@ -75,3 +75,21 @@ GET logs-ti_test/_search
     }
   }
 }
+
+// reset marks
+
+POST filebeat-*/_update_by_query
+{
+  "script": "ctx._source.remove('threat.detection.indicator')",
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "exists": {
+            "field": "threat.detection.indicator"
+          }
+        }
+      ]
+    }
+  }
+}

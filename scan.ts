@@ -181,6 +181,8 @@ export const scan = async (
 
   const start = Date.now();
 
+  let updatesCount = 0;
+
   for await (const threats of documentGenerator<Threat>(client, threatIndex)) {
     await async.eachLimit(
       threats,
@@ -221,7 +223,20 @@ export const scan = async (
         // This marks all the events matching the threat with a timestamp and threat id, so that we can do
         // aggregations on this information later.
         // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
-        await mark(client, eventsIndex, query, threatId, Date.now());
+        const {
+          batches,
+          updated,
+          total: processedCount,
+          requests_per_second: rps,
+        } = await mark(client, eventsIndex, query, threatId, Date.now());
+
+        updatesCount += updated || 0;
+
+        if (updated) {
+          verboseLog(
+            `batches=${batches} updated=${updated} rps=${rps} processed_count=${processedCount}`
+          );
+        }
       }
     );
   }
@@ -232,5 +247,7 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  log(`scan done in ${duration}s, threats per second: ${tps}`);
+  log(
+    `scan done in ${duration}s, threats per second: ${tps}, updated docs: ${updatesCount}`
+  );
 };
