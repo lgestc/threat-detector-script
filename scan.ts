@@ -22,6 +22,7 @@ import type {
   SortResults,
   QueryDslQueryContainer,
   SearchHit,
+  BulkUpdateOperation,
 } from "@elastic/elasticsearch/lib/api/types";
 
 /**
@@ -54,8 +55,8 @@ export const shouldClauseForThreat = (threat: Threat) => {
   }
 };
 
-export const THREAT_DETECTION_INDICATOR_FIELD =
-  "threat.detection.indicator" as const;
+export const THREAT_DETECTION_MATCH_COUNT_FIELD =
+  "threat.detection.match.count" as const;
 
 export const THREAT_DETECTION_TIMESTAMP_FIELD =
   "threat.detection.timestamp" as const;
@@ -64,8 +65,8 @@ const updateMapping = async (client: Client, eventsIndex: string[]) => {
   await client.indices.putMapping({
     index: eventsIndex,
     properties: {
-      [THREAT_DETECTION_INDICATOR_FIELD]: {
-        type: "keyword",
+      [THREAT_DETECTION_MATCH_COUNT_FIELD]: {
+        type: "byte",
       },
       [THREAT_DETECTION_TIMESTAMP_FIELD]: {
         type: "date",
@@ -74,11 +75,11 @@ const updateMapping = async (client: Client, eventsIndex: string[]) => {
   });
 };
 
-export const mark = async (
+export const markIndicator = async (
   es: Client,
   index: string[],
   query: QueryDslQueryContainer,
-  indicator: string,
+  count: number,
   timestamp: number
 ) =>
   es.updateByQuery({
@@ -86,14 +87,15 @@ export const mark = async (
     query,
     script: {
       lang: "painless",
-      source: `ctx._source["${THREAT_DETECTION_TIMESTAMP_FIELD}"] = params.timestamp; ctx._source["${THREAT_DETECTION_INDICATOR_FIELD}"] = params.indicator`,
+      source: `ctx._source["${THREAT_DETECTION_TIMESTAMP_FIELD}"] = params.timestamp; ctx._source["${THREAT_DETECTION_MATCH_COUNT_FIELD}"] = params.indicator`,
       params: {
         timestamp,
-        indicator,
+        count,
       },
     },
     conflicts: "proceed",
     refresh: false,
+    max_docs: 1,
   });
 
 export const getDocuments = async <T = unknown>(
@@ -118,8 +120,19 @@ export const getDocuments = async <T = unknown>(
   return hits;
 };
 
-export const countDocuments = async (client: Client, index: string[]) =>
-  (await client.count({ index })).count;
+export const countDocuments = async (
+  client: Client,
+  index: string[],
+  query?: QueryDslQueryContainer,
+  terminateAfter?: number
+) =>
+  (
+    await client.count({
+      index,
+      query,
+      terminate_after: terminateAfter,
+    })
+  ).count;
 
 async function* documentGenerator<T>(
   client: Client,
@@ -184,13 +197,15 @@ export const scan = async (
   let updatesCount = 0;
 
   for await (const threats of documentGenerator<Threat>(client, threatIndex)) {
+    const matches: Array<{ count: number; id: string; index: string }> = [];
+
     await async.eachLimit(
       threats,
       concurrency,
-      async ({ _source: threat, _id: threatId }) => {
+      async ({ _source: threat, _id: threatId, _index: threatIndex }) => {
         progress++;
 
-        verboseLog(`processing threat ${threatId} (${progress}/${total})`);
+        // verboseLog(`processing threat ${threatId} (${progress}/${total})`);
 
         if (!threat) {
           verboseLog(`source is missing`);
@@ -213,32 +228,30 @@ export const scan = async (
             // matching the threat.
             must_not: {
               exists: {
-                field: THREAT_DETECTION_INDICATOR_FIELD,
+                field: THREAT_DETECTION_MATCH_COUNT_FIELD,
               },
             },
             should: shouldClause,
           },
         };
 
-        // This marks all the events matching the threat with a timestamp and threat id, so that we can do
-        // aggregations on this information later.
-        // We should probably use some fields from the ECS to mark the indicators instead of custom ones.
-        const {
-          batches,
-          updated,
-          total: processedCount,
-          requests_per_second: rps,
-        } = await mark(client, eventsIndex, query, threatId, Date.now());
+        const count = await countDocuments(client, eventsIndex, query, 100);
 
-        updatesCount += updated || 0;
-
-        if (updated) {
-          verboseLog(
-            `batches=${batches} updated=${updated} rps=${rps} processed_count=${processedCount}`
-          );
-        }
+        matches.push({ count, id: threatId, index: threatIndex });
       }
     );
+
+    const operations: any[] = matches.flatMap((match) => [
+      {
+        update: {
+          _id: match.id,
+          _index: match.index,
+        },
+      },
+      { doc: { [THREAT_DETECTION_MATCH_COUNT_FIELD]: match.count } },
+    ]);
+
+    await client.bulk({ operations });
   }
 
   const end = Date.now();
