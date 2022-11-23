@@ -209,7 +209,7 @@ export const scan = async (
     await async.eachLimit(
       threats,
       concurrency,
-      async ({ _source: threat, _id: threatId, _index: threatIndex }) => {
+      async ({ _source: threat, _id: threatId, _index: index }) => {
         progress++;
 
         verboseLog(`processing threat ${threatId} (${progress}/${total})`);
@@ -238,7 +238,7 @@ export const scan = async (
         // This can be configurable
         const count = await countDocuments(client, eventsIndex, query, 100);
 
-        matches.push({ count, id: threatId, index: threatIndex });
+        matches.push({ count, id: threatId, index });
       }
     );
 
@@ -249,7 +249,12 @@ export const scan = async (
           _index: match.index,
         },
       },
-      { doc: { [THREAT_DETECTION_MATCH_COUNT_FIELD]: match.count } },
+      {
+        doc: {
+          [THREAT_DETECTION_MATCH_COUNT_FIELD]: match.count,
+          [THREAT_DETECTION_TIMESTAMP_FIELD]: Date.now(),
+        },
+      },
     ]);
 
     await client.bulk({ operations });
