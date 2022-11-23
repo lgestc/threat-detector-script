@@ -22,7 +22,6 @@ import type {
   SortResults,
   QueryDslQueryContainer,
   SearchHit,
-  BulkUpdateOperation,
 } from "@elastic/elasticsearch/lib/api/types";
 
 /**
@@ -61,12 +60,12 @@ export const THREAT_DETECTION_MATCH_COUNT_FIELD =
 export const THREAT_DETECTION_TIMESTAMP_FIELD =
   "threat.detection.timestamp" as const;
 
-const updateMapping = async (client: Client, eventsIndex: string[]) => {
+const updateMapping = async (client: Client, threatIndex: string[]) => {
   await client.indices.putMapping({
-    index: eventsIndex,
+    index: threatIndex,
     properties: {
       [THREAT_DETECTION_MATCH_COUNT_FIELD]: {
-        type: "byte",
+        type: "short",
       },
       [THREAT_DETECTION_TIMESTAMP_FIELD]: {
         type: "date",
@@ -183,9 +182,9 @@ export const scan = async (
     log(message);
   };
 
-  log("update input indices mapping");
+  log("update threat indices mapping");
 
-  await updateMapping(client, eventsIndex);
+  await updateMapping(client, threatIndex);
 
   log("starting scan");
 
@@ -194,9 +193,17 @@ export const scan = async (
 
   const start = Date.now();
 
-  let updatesCount = 0;
-
-  for await (const threats of documentGenerator<Threat>(client, threatIndex)) {
+  for await (const threats of documentGenerator<Threat>(client, threatIndex, {
+    // This prevents processing threats that were already checked. That means, after initial "scan",
+    // subsequent runs will be a lot faster - though we need to clear this after some time probably
+    bool: {
+      must_not: {
+        exists: {
+          field: THREAT_DETECTION_TIMESTAMP_FIELD,
+        },
+      },
+    },
+  })) {
     const matches: Array<{ count: number; id: string; index: string }> = [];
 
     await async.eachLimit(
@@ -205,7 +212,7 @@ export const scan = async (
       async ({ _source: threat, _id: threatId, _index: threatIndex }) => {
         progress++;
 
-        // verboseLog(`processing threat ${threatId} (${progress}/${total})`);
+        verboseLog(`processing threat ${threatId} (${progress}/${total})`);
 
         if (!threat) {
           verboseLog(`source is missing`);
@@ -223,18 +230,12 @@ export const scan = async (
 
         const query: QueryDslQueryContainer = {
           bool: {
-            // This prevents processing events that were already checked. That means, after initial "scan",
-            // subsequent runs will be a lot faster - as we are not updating the events we already noticed as
-            // matching the threat.
-            must_not: {
-              exists: {
-                field: THREAT_DETECTION_MATCH_COUNT_FIELD,
-              },
-            },
             should: shouldClause,
           },
         };
 
+        // Threat match query is terminated once we count 100 max, for performance.
+        // This can be configurable
         const count = await countDocuments(client, eventsIndex, query, 100);
 
         matches.push({ count, id: threatId, index: threatIndex });
@@ -260,7 +261,5 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  log(
-    `scan done in ${duration}s, threats per second: ${tps}, updated docs: ${updatesCount}`
-  );
+  log(`scan done in ${duration}s, threats per second: ${tps}`);
 };
