@@ -5,17 +5,13 @@
  * 2.0.
  */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 import type { Client } from "@elastic/elasticsearch";
 import async from "async";
+import get from "lodash/get";
 
-export interface Threat {
-  "threat.indicator.type": string;
-  "threat.indicator.url.full": string;
-  "threat.indicator.file.hash.md5": string;
-  "threat.indicator.file.hash.sha1": string;
-}
+const TERMINATE_AFTER = 100;
+
+export type ThreatSource = Record<RawIndicatorFieldId, unknown>;
 
 import type {
   OpenPointInTimeResponse,
@@ -23,85 +19,65 @@ import type {
   QueryDslQueryContainer,
   SearchHit,
 } from "@elastic/elasticsearch/lib/api/types";
+import { RawIndicatorFieldId } from "./indicator";
 
 /**
- * Returns filter clause with 'match' conditions for relevant fields only
- * @param threat
- * @returns
+ * Most of these are present in the 'threat.indicator' generating 'should' clauses can
+ * be automated
  */
-export const shouldClauseForThreat = (threat: Threat) => {
-  switch (threat["threat.indicator.type"]) {
-    case "url": {
-      return [
-        {
-          match: {
-            "url.full": threat["threat.indicator.url.full"],
-          },
-        },
-      ];
-    }
+const FIELDS = [
+  "url.full",
+  "file.hash.sha1",
+  "file.hash.md5",
+  "file.pe.imphash",
+  "source.ip",
+  "destination.ip",
+];
 
-    case "file": {
-      return [
-        {
-          match: {
-            "file.hash.md5": threat["threat.indicator.file.hash.md5"],
-            "file.hash.sha1": threat["threat.indicator.file.hash.sha1"],
-          },
-        },
-      ];
-    }
-  }
-};
-
-export const THREAT_DETECTION_MATCH_COUNT_FIELD =
-  "threat.detection.match.count" as const;
-
-export const THREAT_DETECTION_TIMESTAMP_FIELD =
-  "threat.detection.timestamp" as const;
+/**
+ * Returns filter clause with 'match' conditions
+ */
+export const shouldClauseForThreat = (
+  threat: ThreatSource
+): Array<{ match: { [key: string]: string | undefined } }> =>
+  FIELDS.map((field) => [
+    field,
+    get(threat, `threat.indicator.${field.includes(".ip") ? "ip" : field}`),
+  ])
+    .filter(([_field, value]) => value)
+    .map(([field, value]) => ({
+      match: {
+        [field]: value,
+      },
+    }));
 
 const updateMapping = async (client: Client, threatIndex: string[]) => {
   await client.indices.putMapping({
     index: threatIndex,
     properties: {
-      [THREAT_DETECTION_MATCH_COUNT_FIELD]: {
-        type: "short",
-      },
-      [THREAT_DETECTION_TIMESTAMP_FIELD]: {
-        type: "date",
+      threat: {
+        properties: {
+          detection: {
+            properties: {
+              matches: {
+                type: "long",
+              },
+              timestamp: {
+                type: "date",
+              },
+            },
+          },
+        },
       },
     },
   });
 };
 
-export const markIndicator = async (
-  es: Client,
-  index: string[],
-  query: QueryDslQueryContainer,
-  count: number,
-  timestamp: number
-) =>
-  es.updateByQuery({
-    index,
-    query,
-    script: {
-      lang: "painless",
-      source: `ctx._source["${THREAT_DETECTION_TIMESTAMP_FIELD}"] = params.timestamp; ctx._source["${THREAT_DETECTION_MATCH_COUNT_FIELD}"] = params.indicator`,
-      params: {
-        timestamp,
-        count,
-      },
-    },
-    conflicts: "proceed",
-    refresh: false,
-    max_docs: 1,
-  });
-
 export const getDocuments = async <T = unknown>(
   es: Client,
   pit: string,
   query?: QueryDslQueryContainer,
-  after?: any
+  after?: SortResults
 ): Promise<Array<SearchHit<T>>> => {
   const {
     hits: { hits },
@@ -122,16 +98,28 @@ export const getDocuments = async <T = unknown>(
 export const countDocuments = async (
   client: Client,
   index: string[],
-  query?: QueryDslQueryContainer,
-  terminateAfter?: number
+  query?: QueryDslQueryContainer
 ) =>
   (
     await client.count({
       index,
       query,
-      terminate_after: terminateAfter,
     })
   ).count;
+
+export const cappedCount = async (
+  client: Client,
+  index: string[],
+  query?: QueryDslQueryContainer
+) =>
+  (
+    await client.search({
+      index,
+      query,
+      terminate_after: TERMINATE_AFTER,
+      rest_total_hits_as_int: true,
+    })
+  ).hits.total as number;
 
 async function* documentGenerator<T>(
   client: Client,
@@ -186,70 +174,123 @@ export const scan = async (
 
   await updateMapping(client, threatIndex);
 
-  log("starting scan");
+  log(`starting scan verbose=${verbose}`);
 
-  const total = await countDocuments(client, threatIndex);
+  const threatQuery: QueryDslQueryContainer = {
+    bool: {
+      should: [
+        {
+          range: {
+            // Skip indicators checked within the time window
+            [RawIndicatorFieldId.DetectionTimestamp]: {
+              lte: "now-1m",
+            },
+          },
+        },
+        {
+          bool: {
+            must_not: {
+              exists: {
+                field: RawIndicatorFieldId.DetectionTimestamp,
+              },
+            },
+          },
+        },
+      ],
+    },
+  };
+
+  const total = await countDocuments(client, threatIndex, threatQuery);
+
+  log(`total threats to process=${total}`);
+
   let progress = 0;
 
   const start = Date.now();
 
-  for await (const threats of documentGenerator<Threat>(client, threatIndex, {
-    // This prevents processing threats that were already checked. That means, after initial "scan",
-    // subsequent runs will be a lot faster - though we need to clear this after some time probably
-    bool: {
-      must_not: {
-        exists: {
-          field: THREAT_DETECTION_TIMESTAMP_FIELD,
-        },
-      },
-    },
-  })) {
+  for await (const threats of documentGenerator<ThreatSource>(
+    client,
+    threatIndex,
+    threatQuery
+  )) {
     const matches: Array<{ count: number; id: string; index: string }> = [];
 
     await async.eachLimit(
       threats,
       concurrency,
-      async ({ _source: threat, _id: threatId, _index: threatIndex }) => {
+      async ({ _source: threat, _id: threatId, _index: index }) => {
         progress++;
 
         verboseLog(`processing threat ${threatId} (${progress}/${total})`);
 
         if (!threat) {
-          verboseLog(`source is missing`);
+          log(`source is missing`);
           return;
         }
 
         const shouldClause = shouldClauseForThreat(threat);
 
-        if (!shouldClause) {
-          verboseLog(
-            `skipping threat as no clauses are defined for its type: ${threat["threat.indicator.type"]}`
-          );
-          return;
-        }
+        const lastProcessedTimestamp = get(
+          threat,
+          RawIndicatorFieldId.DetectionTimestamp
+        );
 
-        const query: QueryDslQueryContainer = {
+        const eventsQuery: QueryDslQueryContainer = {
           bool: {
+            minimum_should_match: 1,
             should: shouldClause,
+            ...(lastProcessedTimestamp
+              ? {
+                  must: {
+                    range: {
+                      "@timestamp": {
+                        // Process only the events that were registered after the latest scan
+                        gte: Number(lastProcessedTimestamp),
+                      },
+                    },
+                  },
+                }
+              : {}),
           },
         };
 
-        // Threat match query is terminated once we count 100 max, for performance.
-        // This can be configurable
-        const count = await countDocuments(client, eventsIndex, query, 100);
+        const count = await cappedCount(client, eventsIndex, eventsQuery);
 
-        matches.push({ count, id: threatId, index: threatIndex });
+        const knownThreats = Number(
+          get(threat, RawIndicatorFieldId.Matches) || 0
+        );
+
+        if (count) {
+          log(
+            `threat ${threatId} matched in at last ${count} new documents (~${knownThreats} matches known before)`
+          );
+        }
+
+        matches.push({
+          count: Number(knownThreats + count),
+          id: threatId,
+          index,
+        });
       }
     );
 
-    const operations: any[] = matches.flatMap((match) => [
+    const operations = matches.flatMap((match) => [
       {
         update: {
           _id: match.id,
           _index: match.index,
         },
       },
-      { doc: { [THREAT_DETECTION_MATCH_COUNT_FIELD]: match.count } },
+      {
+        doc: {
+          threat: {
+            detection: {
+              timestamp: Date.now(),
+              matches: match.count,
+            },
+          },
+        },
+      },
     ]);
 
     await client.bulk({ operations });
