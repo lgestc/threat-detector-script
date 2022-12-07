@@ -178,6 +178,7 @@ export const scan = async (
 
   const threatQuery: QueryDslQueryContainer = {
     bool: {
+      minimum_should_match: 1,
       should: [
         {
           range: {
