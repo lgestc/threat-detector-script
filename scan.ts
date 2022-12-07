@@ -203,6 +203,8 @@ export const scan = async (
 
   const total = await countDocuments(client, threatIndex, threatQuery);
 
+  let newThreats = 0;
+
   log(`total threats to process=${total}`);
 
   let progress = 0;
@@ -257,6 +259,8 @@ export const scan = async (
 
         const count = await cappedCount(client, eventsIndex, eventsQuery);
 
+        newThreats += count;
+
         const knownThreats = Number(
           get(threat, RawIndicatorFieldId.Matches) || 0
         );
@@ -303,5 +307,5 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  log(`scan done in ${duration}s, threats per second: ${tps}`);
+  log(`scan done in ${duration}s, threats per second: ${tps}, new threats: ${newThreats}`);
 };
