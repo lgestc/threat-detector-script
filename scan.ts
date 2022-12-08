@@ -9,8 +9,6 @@ import type { Client } from "@elastic/elasticsearch";
 import async from "async";
 import get from "lodash/get";
 
-const TERMINATE_AFTER = 100;
-
 export type ThreatSource = Record<RawIndicatorFieldId, unknown>;
 
 import type {
@@ -107,7 +105,7 @@ export const countDocuments = async (
     })
   ).count;
 
-export const cappedCount = async (
+export const fastCount = async (
   client: Client,
   index: string[],
   query?: QueryDslQueryContainer
@@ -116,8 +114,9 @@ export const cappedCount = async (
     await client.search({
       index,
       query,
-      terminate_after: TERMINATE_AFTER,
+      terminate_after: 1,
       rest_total_hits_as_int: true,
+      size: 0,
     })
   ).hits.total as number;
 
@@ -257,7 +256,7 @@ export const scan = async (
           },
         };
 
-        const count = await cappedCount(client, eventsIndex, eventsQuery);
+        const count = await fastCount(client, eventsIndex, eventsQuery);
 
         newThreats += count;
 
