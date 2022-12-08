@@ -266,7 +266,7 @@ export const scan = async (
         );
 
         if (count) {
-          log(
+          verboseLog(
             `threat ${threatId} matched in at last ${count} new documents (~${knownThreats} matches known before)`
           );
         }
@@ -307,5 +307,7 @@ export const scan = async (
 
   const tps = Math.floor(total / duration);
 
-  log(`scan done in ${duration}s, threats per second: ${tps}, new threats: ${newThreats}`);
+  log(
+    `scan done in ${duration}s, threats per second: ${tps}, new threats: ${newThreats}`
+  );
 };
