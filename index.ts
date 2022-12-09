@@ -22,7 +22,8 @@ const entry = async () => {
       eventsIndex: EVENTS_INDEX,
       threatIndex: THREATS_INDEX,
       concurrency: CONCURRENCY,
-      verbose: false,
+      verbose: true,
+      interval: "1m",
     }
   );
 };

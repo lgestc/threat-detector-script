@@ -34,10 +34,7 @@ const FIELDS = [
 
 const BATCH_SIZE = 1000;
 
-// Scan will be paused if it takes too long
-const MAX_DURATION_IN_SECONDS = 60 * 5;
-
-const THREAT_QUERY: QueryDslQueryContainer = {
+const threatQuery = (interval: string): QueryDslQueryContainer => ({
   bool: {
     minimum_should_match: 1,
     should: [
@@ -45,7 +42,7 @@ const THREAT_QUERY: QueryDslQueryContainer = {
         range: {
           // Skip indicators checked within the time window
           [RawIndicatorFieldId.DetectionTimestamp]: {
-            lte: "now-1m", // make it dynamic, using the schedule setting
+            lte: `now-${interval}`, // make it dynamic, using the schedule setting
           },
         },
       },
@@ -60,7 +57,7 @@ const THREAT_QUERY: QueryDslQueryContainer = {
       },
     ],
   },
-};
+});
 
 /**
  * Returns filter clause with 'match' conditions
@@ -104,7 +101,8 @@ const updateMapping = async (client: Client, threatIndex: string[]) => {
 export const getDocuments = async <T = unknown>(
   es: Client,
   pit: string,
-  query?: QueryDslQueryContainer,
+  query: QueryDslQueryContainer,
+  sortSalt: string,
   after?: SortResults
 ): Promise<Array<SearchHit<T>>> => {
   const {
@@ -115,7 +113,19 @@ export const getDocuments = async <T = unknown>(
       keep_alive: "1m",
     },
     size: BATCH_SIZE,
-    sort: ["@timestamp"],
+    sort: {
+      _script: {
+        type: "number",
+        script: {
+          lang: "painless",
+          params: {
+            salt: sortSalt,
+          },
+          source: "(doc['@timestamp'].value + params.salt).hashCode()",
+        },
+        order: "asc",
+      },
+    },
     ...(query ? { query } : {}),
     ...(after ? { search_after: after } : {}),
   });
@@ -193,7 +203,8 @@ export const matchEvents = async (
 async function* documentGenerator<T>(
   client: Client,
   index: string[],
-  query?: QueryDslQueryContainer
+  query: QueryDslQueryContainer,
+  sortSalt: string
 ) {
   let after: SortResults | undefined;
 
@@ -205,7 +216,7 @@ async function* documentGenerator<T>(
   ).id;
 
   while (true) {
-    const docs = await getDocuments<T>(client, pit, query, after);
+    const docs = await getDocuments<T>(client, pit, query, sortSalt, after);
 
     if (!docs.length) {
       break;
@@ -217,14 +228,25 @@ async function* documentGenerator<T>(
   }
 }
 
-const threatGenerator = (client: Client, threatIndex: string[]) =>
-  documentGenerator<ThreatSource>(client, threatIndex, THREAT_QUERY);
+const threatGenerator = (
+  client: Client,
+  threatIndex: string[],
+  interval: string,
+  sortSalt: string
+) =>
+  documentGenerator<ThreatSource>(
+    client,
+    threatIndex,
+    threatQuery(interval),
+    sortSalt
+  );
 
 interface ScanParams {
   threatIndex: string[];
   eventsIndex: string[];
   concurrency: number;
   verbose: boolean;
+  interval: string;
 }
 
 interface ScanDependencies {
@@ -234,7 +256,13 @@ interface ScanDependencies {
 
 export const scan = async (
   { client, log }: ScanDependencies,
-  { threatIndex, eventsIndex, concurrency, verbose }: ScanParams
+  {
+    threatIndex,
+    eventsIndex,
+    concurrency,
+    verbose,
+    interval = "1m",
+  }: ScanParams
 ) => {
   const verboseLog = (message: string) => {
     if (!verbose) {
@@ -250,7 +278,11 @@ export const scan = async (
 
   log(`starting scan verbose=${verbose}`);
 
-  const total = await countDocuments(client, threatIndex, THREAT_QUERY);
+  const total = await countDocuments(
+    client,
+    threatIndex,
+    threatQuery(interval)
+  );
 
   let newThreats = 0;
 
@@ -260,17 +292,28 @@ export const scan = async (
 
   const start = Date.now();
 
-  // Will be used for auto-regulation. If we know how much 1000 threats took,
-  // we can make an assumption about the entire run.
-  const firstBatchStart = Date.now();
-
-  let firstBatchDuration = 0;
+  const sortSalt = `${start}`;
 
   let paused = false;
 
-  for await (const threats of threatGenerator(client, threatIndex)) {
+  // Scan will be paused if it takes too long
+  const intervalMultiplier = interval.includes("m")
+    ? 60
+    : interval.includes("h")
+    ? 3600
+    : 1;
+  const intervalInSeconds = parseInt(interval, 10) * intervalMultiplier;
+
+  log(`intervalInSeconds=${intervalInSeconds}`);
+
+  for await (const threats of threatGenerator(
+    client,
+    threatIndex,
+    interval,
+    sortSalt
+  )) {
     // pause if it is taking too long, scan will resume in subsequent run
-    if (Date.now() - start > MAX_DURATION_IN_SECONDS * 1000 - 100) {
+    if (Date.now() - start > intervalInSeconds * 1000 - 100) {
       paused = true;
       break;
     }
@@ -336,21 +379,6 @@ export const scan = async (
     ]);
 
     await client.bulk({ operations });
-
-    const firstBatchEnd = Date.now();
-
-    // Some estimations on how long it will take
-    if (!firstBatchDuration) {
-      firstBatchDuration = (firstBatchEnd - firstBatchStart) / 1000;
-
-      const totalBatches = Math.round(total / BATCH_SIZE);
-
-      const estimate = totalBatches * firstBatchDuration;
-
-      log(
-        `first batch took: ${firstBatchDuration}s out of max ${MAX_DURATION_IN_SECONDS}s, estimated total time: ${estimate}s`
-      );
-    }
   }
 
   const end = Date.now();
