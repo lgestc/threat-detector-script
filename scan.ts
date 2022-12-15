@@ -34,15 +34,15 @@ const FIELDS = [
 
 const BATCH_SIZE = 1000;
 
-const threatQuery = (interval: string): QueryDslQueryContainer => ({
+const threatQuery = (): QueryDslQueryContainer => ({
   bool: {
     minimum_should_match: 1,
     should: [
       {
         range: {
           // Skip indicators checked within the time window
-          [RawIndicatorFieldId.DetectionTimestamp]: {
-            lte: `now-${interval}`, // make it dynamic, using the schedule setting
+          [RawIndicatorFieldId.DetectionNextScan]: {
+            lte: "now",
           },
         },
       },
@@ -50,7 +50,7 @@ const threatQuery = (interval: string): QueryDslQueryContainer => ({
         bool: {
           must_not: {
             exists: {
-              field: RawIndicatorFieldId.DetectionTimestamp,
+              field: RawIndicatorFieldId.DetectionLastScan,
             },
           },
         },
@@ -87,8 +87,14 @@ const updateMapping = async (client: Client, threatIndex: string[]) => {
               matches: {
                 type: "long",
               },
-              timestamp: {
+              last_scan: {
                 type: "date",
+              },
+              next_scan: {
+                type: "date",
+              },
+              scans: {
+                type: "long",
               },
             },
           },
@@ -175,7 +181,7 @@ export const matchEvents = async (
 
   const lastProcessedTimestamp = get(
     threat,
-    RawIndicatorFieldId.DetectionTimestamp
+    RawIndicatorFieldId.DetectionLastScan
   );
 
   const eventsQuery: QueryDslQueryContainer = {
@@ -234,12 +240,7 @@ const threatGenerator = (
   interval: string,
   sortSalt: string
 ) =>
-  documentGenerator<ThreatSource>(
-    client,
-    threatIndex,
-    threatQuery(interval),
-    sortSalt
-  );
+  documentGenerator<ThreatSource>(client, threatIndex, threatQuery(), sortSalt);
 
 interface ScanParams {
   threatIndex: string[];
@@ -253,6 +254,18 @@ interface ScanDependencies {
   client: Client;
   log: (message: string) => void;
 }
+
+export const parseInterval = (interval: string) => {
+  // Scan will be paused if it takes too long
+  const intervalMultiplier = interval.includes("m")
+    ? 60
+    : interval.includes("h")
+    ? 3600
+    : 1;
+  const intervalInSeconds = parseInt(interval, 10) * intervalMultiplier;
+
+  return intervalInSeconds;
+};
 
 export const scan = async (
   { client, log }: ScanDependencies,
@@ -278,11 +291,7 @@ export const scan = async (
 
   log(`starting scan verbose=${verbose}`);
 
-  const total = await countDocuments(
-    client,
-    threatIndex,
-    threatQuery(interval)
-  );
+  const total = await countDocuments(client, threatIndex, threatQuery());
 
   let newThreats = 0;
 
@@ -292,33 +301,33 @@ export const scan = async (
 
   const start = Date.now();
 
-  const sortSalt = `${start}`;
-
   let paused = false;
 
-  // Scan will be paused if it takes too long
-  const intervalMultiplier = interval.includes("m")
-    ? 60
-    : interval.includes("h")
-    ? 3600
-    : 1;
-  const intervalInSeconds = parseInt(interval, 10) * intervalMultiplier;
-
-  log(`intervalInSeconds=${intervalInSeconds}`);
+  const intervalInSeconds = parseInterval(interval);
 
   for await (const threats of threatGenerator(
     client,
     threatIndex,
     interval,
-    sortSalt
+    `${start}`
   )) {
+    const MAX_ALLOWED_EXECUTION_TIME = intervalInSeconds * 1000 - 100;
+
     // pause if it is taking too long, scan will resume in subsequent run
-    if (Date.now() - start > intervalInSeconds * 1000 - 100) {
+    // picking up where it left off
+    if (Date.now() - start > MAX_ALLOWED_EXECUTION_TIME) {
       paused = true;
       break;
     }
 
-    const matches: Array<{ count: number; id: string; index: string }> = [];
+    const matches: Array<{
+      count: number;
+      id: string;
+      index: string;
+      nextScan: number;
+      lastScan: number;
+      scans: number;
+    }> = [];
 
     await async.eachLimit(
       threats,
@@ -342,12 +351,22 @@ export const scan = async (
         newThreats += minMatchingEventsCount;
 
         const knownThreats = Number(
-          get(threat, RawIndicatorFieldId.Matches) || 0
+          get(threat, RawIndicatorFieldId.DetectionMatches) || 0
         );
+
+        const scans =
+          Number(get(threat, RawIndicatorFieldId.DetectionScans)) || 0;
+
+        // With each scan, we are pushing the offset for revisiting given threat in the future
+        // 1st rescan will happen on next run,
+        // 2nd after 5 minutes
+        // 3rd one after 25 minutes
+        // Generally after scan^2 * 5 minutes
+        const nextScan = Date.now() + scans ** 2 * 5 * 1000 * 60;
 
         if (minMatchingEventsCount) {
           verboseLog(
-            `threat ${threatId} matched in at last ${minMatchingEventsCount} new documents (~${knownThreats} matches known before)`
+            `threat ${threatId} matched in at least ${minMatchingEventsCount} new documents (~${knownThreats} matches known before)`
           );
         }
 
@@ -355,6 +374,9 @@ export const scan = async (
           count: Number(knownThreats + minMatchingEventsCount),
           id: threatId,
           index,
+          nextScan,
+          lastScan: Date.now(),
+          scans: scans + 1,
         });
       }
     );
@@ -370,7 +392,9 @@ export const scan = async (
         doc: {
           threat: {
             detection: {
-              timestamp: Date.now(),
+              next_scan: match.nextScan,
+              last_scan: match.lastScan,
+              scans: match.scans,
               matches: match.count,
             },
           },

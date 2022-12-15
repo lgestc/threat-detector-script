@@ -41,6 +41,8 @@ export enum RawIndicatorFieldId {
   Name = "threat.indicator.name",
   Description = "threat.indicator.description",
   NameOrigin = "threat.indicator.name_origin",
-  Matches = "threat.detection.matches",
-  DetectionTimestamp = "threat.detection.timestamp",
+  DetectionMatches = "threat.detection.matches",
+  DetectionLastScan = "threat.detection.last_scan",
+  DetectionNextScan = "threat.detection.next_scan",
+  DetectionScans = "threat.detection.scans",
 }
