@@ -117,7 +117,7 @@ const threatsPendingFirstScan = async () =>
         bool: {
           must_not: {
             exists: {
-              field: "threat.detection.timestamp",
+              field: "threat.detection.last_scan",
             },
           },
         },
@@ -237,7 +237,7 @@ const entry = async () => {
     {
       threats: 100_000,
       events: 1_000_000,
-      interval: "1m",
+      interval: "5m",
       runs: 10,
     },
   ];

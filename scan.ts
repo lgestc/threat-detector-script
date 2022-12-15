@@ -108,7 +108,6 @@ export const getDocuments = async <T = unknown>(
   es: Client,
   pit: string,
   query: QueryDslQueryContainer,
-  sortSalt: string,
   after?: SortResults
 ): Promise<Array<SearchHit<T>>> => {
   const {
@@ -119,19 +118,7 @@ export const getDocuments = async <T = unknown>(
       keep_alive: "1m",
     },
     size: BATCH_SIZE,
-    sort: {
-      _script: {
-        type: "number",
-        script: {
-          lang: "painless",
-          params: {
-            salt: sortSalt,
-          },
-          source: "(doc['@timestamp'].value + params.salt).hashCode()",
-        },
-        order: "asc",
-      },
-    },
+    sort: ["@timestamp"],
     ...(query ? { query } : {}),
     ...(after ? { search_after: after } : {}),
   });
@@ -209,8 +196,7 @@ export const matchEvents = async (
 async function* documentGenerator<T>(
   client: Client,
   index: string[],
-  query: QueryDslQueryContainer,
-  sortSalt: string
+  query: QueryDslQueryContainer
 ) {
   let after: SortResults | undefined;
 
@@ -222,7 +208,7 @@ async function* documentGenerator<T>(
   ).id;
 
   while (true) {
-    const docs = await getDocuments<T>(client, pit, query, sortSalt, after);
+    const docs = await getDocuments<T>(client, pit, query, after);
 
     if (!docs.length) {
       break;
@@ -234,13 +220,8 @@ async function* documentGenerator<T>(
   }
 }
 
-const threatGenerator = (
-  client: Client,
-  threatIndex: string[],
-  interval: string,
-  sortSalt: string
-) =>
-  documentGenerator<ThreatSource>(client, threatIndex, threatQuery(), sortSalt);
+const threatGenerator = (client: Client, threatIndex: string[]) =>
+  documentGenerator<ThreatSource>(client, threatIndex, threatQuery());
 
 interface ScanParams {
   threatIndex: string[];
@@ -305,13 +286,8 @@ export const scan = async (
 
   const intervalInSeconds = parseInterval(interval);
 
-  for await (const threats of threatGenerator(
-    client,
-    threatIndex,
-    interval,
-    `${start}`
-  )) {
-    const MAX_ALLOWED_EXECUTION_TIME = intervalInSeconds * 1000 - 100;
+  for await (const threats of threatGenerator(client, threatIndex)) {
+    const MAX_ALLOWED_EXECUTION_TIME = intervalInSeconds * 1000 - 1000;
 
     // pause if it is taking too long, scan will resume in subsequent run
     // picking up where it left off
@@ -358,11 +334,10 @@ export const scan = async (
           Number(get(threat, RawIndicatorFieldId.DetectionScans)) || 0;
 
         // With each scan, we are pushing the offset for revisiting given threat in the future
-        // 1st rescan will happen on next run,
-        // 2nd after 5 minutes
-        // 3rd one after 25 minutes
-        // Generally after scan^2 * 5 minutes
-        const nextScan = Date.now() + scans ** 2 * 5 * 1000 * 60;
+        // 1st rescan after 5 minutes
+        // 2nd one after 10 minutes
+        // Generally after (current scans + 1)^2 * 5 minutes
+        const nextScan = Date.now() + (scans + 1) ** 2 * 1000 * 60 * 5;
 
         if (minMatchingEventsCount) {
           verboseLog(
@@ -413,7 +388,9 @@ export const scan = async (
 
   log(
     `scan ${
-      paused ? "paused (will be picked up in another run)" : "done"
+      paused
+        ? "paused (will be picked up in another run. consider extending the schedule value)"
+        : "done"
     } after ${duration}s, threats per second: ${tps}, new threats: ${newThreats}`
   );
 };
